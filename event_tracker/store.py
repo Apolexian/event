@@ -1,0 +1,54 @@
+"""Persistent tally of observed event outcomes."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+
+def load(path: Path) -> dict[str, Any]:
+    if path.exists():
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save(data: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def record(
+    data: dict[str, Any],
+    story_id: int,
+    event_name: str,
+    choice_index: int,
+    outcome_key: str,
+    diff: dict[str, Any],
+    defined_rewards: list[dict[str, Any]] | None = None,
+) -> None:
+    sid = str(story_id)
+    cidx = str(choice_index)
+
+    if sid not in data:
+        data[sid] = {"story_id": story_id, "event_name": event_name, "choices": {}, "is_outing": story_id < 0}
+
+    event = data[sid]
+    if event_name and event["event_name"].startswith("[story "):
+        event["event_name"] = event_name
+
+    choices = event["choices"]
+    if cidx not in choices:
+        choices[cidx] = {"seen": 0, "outcomes": {}}
+
+    choice = choices[cidx]
+    choice["seen"] += 1
+
+    outcomes = choice["outcomes"]
+    if outcome_key not in outcomes:
+        outcomes[outcome_key] = {"seen": 0, "diff": diff}
+        if defined_rewards:
+            outcomes[outcome_key]["defined_rewards"] = defined_rewards
+    outcomes[outcome_key]["seen"] += 1
