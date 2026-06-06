@@ -20,20 +20,24 @@ def save(data: dict[str, Any], path: Path) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _recompute_percents(choice: dict[str, Any]) -> None:
+    total = choice["seen"]
+    for outcome in choice["outcomes"].values():
+        outcome["percent"] = round(outcome["seen"] / total * 100, 1) if total else 0.0
+
+
 def record(
     data: dict[str, Any],
     story_id: int,
     event_name: str,
     choice_index: int,
     outcome_key: str,
-    diff: dict[str, Any],
-    defined_rewards: list[dict[str, Any]] | None = None,
 ) -> None:
     sid = str(story_id)
     cidx = str(choice_index)
 
     if sid not in data:
-        data[sid] = {"story_id": story_id, "event_name": event_name, "choices": {}, "is_outing": story_id < 0}
+        data[sid] = {"event_name": event_name, "choices": {}}
 
     event = data[sid]
     if event_name and event["event_name"].startswith("[story "):
@@ -48,7 +52,7 @@ def record(
 
     outcomes = choice["outcomes"]
     if outcome_key not in outcomes:
-        outcomes[outcome_key] = {"seen": 0, "diff": diff}
-        if defined_rewards:
-            outcomes[outcome_key]["defined_rewards"] = defined_rewards
+        outcomes[outcome_key] = {"seen": 0, "percent": 0.0}
     outcomes[outcome_key]["seen"] += 1
+
+    _recompute_percents(choice)

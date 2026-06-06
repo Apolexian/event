@@ -17,6 +17,8 @@ _STATE_APIS = {
     "SingleModeLoad",
     "SingleModeFreeLoad",
     "SingleModeFreeExecCommand",
+    "SingleModeGainSkills",
+    "SingleModeFreeGainSkills",
 }
 
 _CHECK_EVENT_APIS = {

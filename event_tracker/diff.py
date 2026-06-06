@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .names import get_card_name, get_npc_name
+from .names import get_card_name, get_npc_name, get_skill_name
 
 STAT_FIELDS = ("speed", "stamina", "power", "guts", "wiz", "skill_point", "vital")
 
@@ -88,7 +88,7 @@ def outcome_key(diff: dict[str, Any]) -> str:
         [f"{f}:{diff[f]:+d}" for f in STAT_FIELDS if f in diff]
         + ([f"mood:{diff['mood_delta']:+d}"] if "mood_delta" in diff else [])
         + [f"bond({pid}):{v:+d}" for pid, v in (diff.get("bond_delta") or {}).items()]
-        + [f"hint:{h['group_id']}+{h['level_delta']}" for h in diff.get("hints", [])]
+        + [f"hint:{get_skill_name(h['group_id'])}+{h['level_delta']}" for h in diff.get("hints", [])]
         + [f"skill:{s}" for s in diff.get("skills_gained", [])]
         + [f"cond+:{c}" for c in diff.get("conditions_gained", [])]
         + [f"cond-:{c}" for c in diff.get("conditions_lost", [])]

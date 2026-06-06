@@ -14,7 +14,6 @@ import msgpack
 from rich.console import Console
 
 from .names import build_lookup
-from .rewards import decode_rewards
 from .store import load, save, record
 from .watcher import watch
 
@@ -138,16 +137,14 @@ def run_cmd(text_data, obs, label, save_every, debug):
 
     def on_observation(story_id: int, event_name: str, choice_index: int, key: str, diff: dict[str, Any], defined: list):
         nonlocal count
-        record(obs_data, story_id, event_name, choice_index, key, diff, defined)
+        record(obs_data, story_id, event_name, choice_index, key)
         count += 1
         diff_str = _format_diff(diff)
-        decoded = decode_rewards(defined, _SCRIPT_ROOT / "data") if defined else []
-        def_str = f" [dim](defined: {' '.join(decoded)})[/dim]" if decoded else ""
         from rich.markup import escape
         console.print(
             f"[cyan]{escape(event_name)}[/cyan] "
             f"[dim](story {story_id})[/dim] "
-            f"choice [yellow]{choice_index}[/yellow] → {diff_str}{def_str}"
+            f"choice [yellow]{choice_index}[/yellow] → {diff_str}"
         )
         if count % save_every == 0:
             save(obs_data, obs_path)
@@ -182,30 +179,29 @@ def show_cmd(story_id, obs):
         console.print("[yellow]No observations yet.[/yellow]")
         return
 
-    entries = list(obs_data.values())
+    entries = list(obs_data.items())
     if story_id is not None:
-        entries = [e for e in entries if e["story_id"] == story_id]
+        entries = [(k, e) for k, e in entries if int(k) == story_id]
         if not entries:
             console.print(f"[yellow]No observations for story_id {story_id}[/yellow]")
             return
 
-    def _print_entry(entry: dict) -> None:
-        console.rule(f"[bold]{entry['event_name']}[/bold] [dim](id {entry['story_id']})[/dim]")
+    def _print_entry(sid: str, entry: dict) -> None:
+        console.rule(f"[bold]{entry['event_name']}[/bold] [dim](id {sid})[/dim]")
         for cidx, choice in sorted(entry["choices"].items(), key=lambda x: int(x[0])):
             console.print(f"  Choice [yellow]{cidx}[/yellow] — seen [bold]{choice['seen']}x[/bold]")
-            for _, outcome in sorted(choice["outcomes"].items(), key=lambda x: x[1]["seen"], reverse=True):
-                pct = outcome["seen"] / choice["seen"] * 100
-                console.print(f"    {outcome['seen']:>4}x  ({pct:5.1f}%)  {_format_diff(outcome['diff'])}")
+            for key, outcome in sorted(choice["outcomes"].items(), key=lambda x: x[1]["seen"], reverse=True):
+                console.print(f"    {outcome['seen']:>4}x  ({outcome['percent']:5.1f}%)  {key}")
 
-    events = sorted([e for e in entries if not e.get("is_outing")], key=lambda e: e["event_name"])
-    outings = sorted([e for e in entries if e.get("is_outing")], key=lambda e: e["event_name"])
+    events = sorted([(k, e) for k, e in entries if int(k) > 0], key=lambda x: x[1]["event_name"])
+    outings = sorted([(k, e) for k, e in entries if int(k) < 0], key=lambda x: x[1]["event_name"])
 
-    for entry in events:
-        _print_entry(entry)
+    for sid, entry in events:
+        _print_entry(sid, entry)
     if outings:
         console.rule("[dim]Outings[/dim]")
-        for entry in outings:
-            _print_entry(entry)
+        for sid, entry in outings:
+            _print_entry(sid, entry)
 
 
 @cli.command("export")
