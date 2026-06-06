@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,7 @@ def _try_msgpack(raw: bytes) -> dict | None:
         return None
 
 
-def _start_collector(session_dir: Path, done: threading.Event) -> None:
+def _start_collector(session_dir: Path, done: threading.Event, all_domains: bool = False) -> None:
     try:
         from lib.attach import attach
     except ImportError:
@@ -73,8 +74,10 @@ def _start_collector(session_dir: Path, done: threading.Event) -> None:
         payload = message.get("payload")
         if not isinstance(payload, dict):
             return
-        if payload.get("type") == "collect" and payload.get("domain") == "network":
-            write(payload.get("data", {}), bytes(data) if data else None)
+        if payload.get("type") == "collect":
+            domain = payload.get("domain", "")
+            if domain == "network" or all_domains:
+                write(payload.get("data", {}), bytes(data) if data else None)
 
     frida_session = attach()
     if not frida_session:
@@ -202,6 +205,71 @@ def show_cmd(story_id, obs):
         console.rule("[dim]Outings[/dim]")
         for sid, entry in outings:
             _print_entry(sid, entry)
+
+
+@cli.command("dump")
+@click.option("--label", default="dump", help="Session label suffix.")
+@click.option("--api", default=None, help="Filter to API name substring (e.g. SingleMode).")
+@click.option("--debug", is_flag=True, default=False, help="Enable debug logging.")
+def dump_cmd(label, api, debug):
+    """Attach to game and print every API response in full."""
+    if debug:
+        logging.basicConfig(level=logging.DEBUG)
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+    session_dir = SESSIONS_DIR / (f"{ts}_{label}" if label else ts)
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    done = threading.Event()
+    collector = threading.Thread(target=_start_collector, args=(session_dir, done, True), daemon=True)
+    collector.start()
+
+    console.print(f"Session: [bold]{session_dir.name}[/bold]")
+    console.print("Dumping all API traffic. Ctrl-C to stop.\n")
+
+    network_file = session_dir / "network.jsonl"
+    while not network_file.exists():
+        if done.is_set():
+            return
+        time.sleep(0.2)
+
+    try:
+        with network_file.open(encoding="utf-8") as f:
+            while not done.is_set():
+                line = f.readline()
+                if not line:
+                    time.sleep(0.2)
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                evt = rec.get("event", "")
+                if evt in ("ssl_read", "ssl_write", "unitytls_write", "libnative_decrypt",
+                           "libnative_encrypt", "schannel_decrypt", "schannel_encrypt",
+                           "ssl_write_reassembled", "crypto_salt_found"):
+                    continue
+                api_name = rec.get("api", "")
+                if api and api.lower() not in api_name.lower() and api.lower() not in evt.lower():
+                    continue
+                if evt in ("api_response", "api_send"):
+                    body = rec.get("msgpack_decoded") or {}
+                    direction = "→" if evt == "api_send" else "←"
+                    color = "yellow" if evt == "api_send" else "cyan"
+                    console.rule(f"[bold {color}]{direction} {api_name}[/bold {color}]")
+                    if body:
+                        console.print_json(json.dumps(body, ensure_ascii=False, default=str))
+                else:
+                    console.rule(f"[bold magenta]{evt}[/bold magenta]")
+                    console.print_json(json.dumps({k: v for k, v in rec.items() if k not in ("_ts",)}, ensure_ascii=False, default=str))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        done.set()
+        collector.join(timeout=5)
 
 
 @cli.command("export")
