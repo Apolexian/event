@@ -88,6 +88,7 @@ def _start_collector(session_dir: Path, done: threading.Event, all_domains: bool
 
     script = frida_session.create_script(_load_js())
     script.on("message", on_message)
+    script.set_log_handler(lambda level, text: log.debug("[JS] %s", text))
     script.load()
 
     done.wait()
