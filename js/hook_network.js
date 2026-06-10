@@ -33,6 +33,8 @@
     var _nextReqId = 0;
     // apiName → reqId (most recent Send for that API)
     var _pendingReqIds = Object.create(null);
+    // most recent chara turn seen in any deserialized response
+    var _lastKnownTurn = 0;
 
     // ══════════════════════════════════════════════════════════════════
     // LAYER 0: libnative.dll LZ4 hooks (request + response)
@@ -1366,6 +1368,24 @@
                                 );
                             }
 
+                            // ── Update last known turn from chara_info ──
+                            try {
+                                if (retval && !retval.isNull() && respInfo) {
+                                    for (var _rfi = 0; _rfi < respInfo.fieldList.length; _rfi++) {
+                                        var _rf = respInfo.fieldList[_rfi];
+                                        if (_rf.name === "chara_info" && _rf.offset > 0) {
+                                            var _charaPtr = retval.add(_rf.offset).readPointer();
+                                            if (_charaPtr && !_charaPtr.isNull()) {
+                                                // turn is at offset 208 on SingleModeChara
+                                                var _turn = _charaPtr.add(208).readS32();
+                                                if (_turn > 0 && _turn < 200) _lastKnownTurn = _turn;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            } catch (e) {}
+
                             // ── Also try reading task object fields after Deserialize ──
                             // Task classes end in "Task" not "Request"/"Response",
                             // so they're not in dataClassPtrs. Extract live (cached).
@@ -1427,6 +1447,300 @@
 
     hookCount += taskHooks;
     console.log("[network] " + taskHooks + " Gallop Task hooks installed.");
+
+    // ══════════════════════════════════════════════════════════════════
+    // LAYER 4: SingleMode UI state hooks
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // When the training screen opens the client reads HomeInfo from a
+    // cached field — no network call fires. We scan for the presenter /
+    // top-screen class that holds this data and hook it so we can emit
+    // command_info_array before any ExecCommand is sent.
+
+    (function hookSingleModeHomeInfo() {
+        // Hook WorkSingleModeHomeInfo.Apply and ApplyFreeCommandInfo.
+        // These fire whenever the client updates its cached HomeInfo from a
+        // server response — including on the very first load before any
+        // ExecCommand is sent. args[1] is the HomeInfo object being applied.
+
+        var workClass = null;
+        var workCharaClass = null;
+        iterAssemblyClasses(function (classPtr, fullName, ns, name) {
+            if (fullName === "Gallop.WorkSingleModeHomeInfo") workClass = { classPtr: classPtr, fullName: fullName };
+            if (fullName === "Gallop.WorkSingleModeChara") workCharaClass = { classPtr: classPtr, fullName: fullName };
+        });
+
+        // Emit WorkSingleModeChara field layout for diagnostics
+        // WorkSingleModeData holds _homeInfo@64 and Character@48.
+        // Find its singleton (static _instance field) so we can read chara turn at hook time.
+        var workDataClass = null;
+        var workDataInstanceOffset = -1;
+        iterAssemblyClasses(function (classPtr, fullName, ns, name) {
+            if (fullName === "Gallop.WorkSingleModeData") workDataClass = classPtr;
+        });
+
+        if (workDataClass) {
+            // Scan static fields for _instance / Instance / s_instance
+            var iter = Memory.alloc(ptrSize);
+            iter.writePointer(ptr(0));
+            var il2cppClassGetFields = api["il2cpp_class_get_fields"];
+            if (il2cppClassGetFields) {
+                var getFields = new NativeFunction(il2cppClassGetFields, "pointer", ["pointer", "pointer"]);
+                for (var fi = 0; fi < 20; fi++) {
+                    var fptr = getFields(workDataClass, iter);
+                    if (!fptr || fptr.isNull()) break;
+                    var fname = fn.field_get_name ? readCStr(fn.field_get_name(fptr)) : "";
+                    var foffset = fn.field_get_offset ? fn.field_get_offset(fptr) : -1;
+                    if (fname.toLowerCase().indexOf("instance") !== -1 || fname === "_instance" || fname === "s_Instance") {
+                        workDataInstanceOffset = foffset;
+                        console.log("[ui] WorkSingleModeData." + fname + " static offset: " + foffset);
+                    }
+                }
+            }
+        }
+
+        if (!workClass) {
+            console.log("[ui] WorkSingleModeHomeInfo not found");
+            return;
+        }
+
+        // Pre-extract field lists for CommandInfo and ParamsIncDecInfo
+        var cmdInfoFieldList = null;
+        var paramsFieldList = null;
+        var homeInfoFieldList = null;
+
+        iterAssemblyClasses(function (classPtr, fullName, ns, name) {
+            if (fullName === "Gallop.SingleModeCommandInfo" || fullName === "Gallop.SingleModeFreeCommandInfo") {
+                if (!cmdInfoFieldList) {
+                    var info = extractClassInfoWithParents(classPtr, fullName);
+                    if (info) cmdInfoFieldList = info.fieldList;
+                    console.log("[ui] " + fullName + " fields: " + info.fieldList.map(function(f){return f.name+":"+f.type;}).join(", "));
+                }
+            }
+            if (fullName === "Gallop.SingleModeParamsIncDecInfo" || fullName === "Gallop.ParamsIncDecInfo" || (name.indexOf("ParamsIncDec") !== -1 && ns === "Gallop")) {
+                if (!paramsFieldList) {
+                    var info = extractClassInfoWithParents(classPtr, fullName);
+                    if (info) paramsFieldList = info.fieldList;
+                    console.log("[ui] " + fullName + " fields: " + info.fieldList.map(function(f){return f.name+":"+f.type;}).join(", "));
+                }
+            }
+            if (fullName === "Gallop.SingleModeHomeInfo") {
+                var info = extractClassInfoWithParents(classPtr, fullName);
+                if (info) homeInfoFieldList = info.fieldList;
+            }
+        });
+
+        // Read il2cpp object[] array — returns array of field-maps
+        function readObjArray(arrPtr, fieldList) {
+            if (!arrPtr || arrPtr.isNull()) return [];
+            try {
+                var lenOffset = ptrSize === 8 ? 24 : 12;
+                var len = arrPtr.add(lenOffset).readS32();
+                if (len <= 0 || len > 50) return [];
+                var dataOffset = ptrSize === 8 ? 32 : 16;
+                var result = [];
+                for (var i = 0; i < len; i++) {
+                    var elemPtr = arrPtr.add(dataOffset + i * ptrSize).readPointer();
+                    if (!elemPtr || elemPtr.isNull()) continue;
+                    var fields = readObjectFields(elemPtr, fieldList);
+                    if (fields) result.push(fields);
+                }
+                return result;
+            } catch (e) {
+                return [];
+            }
+        }
+
+        // Read int32[] array — returns array of numbers
+        function readIntArray(arrPtr) {
+            if (!arrPtr || arrPtr.isNull()) return [];
+            try {
+                var lenOffset = ptrSize === 8 ? 24 : 12;
+                var len = arrPtr.add(lenOffset).readS32();
+                if (len <= 0 || len > 200) return [];
+                var dataOffset = ptrSize === 8 ? 32 : 16;
+                var result = [];
+                for (var i = 0; i < len; i++) {
+                    result.push(arrPtr.add(dataOffset + i * 4).readS32());
+                }
+                return result;
+            } catch (e) {
+                return [];
+            }
+        }
+
+        var workInfo = extractClassInfo(workClass.classPtr, workClass.fullName);
+
+        function emitHomeInfo(label, homeInfoPtr) {
+            if (!homeInfoPtr || homeInfoPtr.isNull()) return;
+            try {
+                // Read top-level HomeInfo fields
+                var topFields = homeInfoFieldList ? readObjectFields(homeInfoPtr, homeInfoFieldList) : {};
+
+                // Find command_info_array field offset
+                var cmdArrayPtr = null;
+                if (homeInfoFieldList) {
+                    for (var i = 0; i < homeInfoFieldList.length; i++) {
+                        var f = homeInfoFieldList[i];
+                        if (f.name === "command_info_array" && f.offset > 0) {
+                            cmdArrayPtr = homeInfoPtr.add(f.offset).readPointer();
+                            break;
+                        }
+                    }
+                }
+
+                var commandInfoArray = [];
+                if (cmdArrayPtr && !cmdArrayPtr.isNull() && cmdInfoFieldList) {
+                    var rawCmds = readObjArray(cmdArrayPtr, cmdInfoFieldList);
+                    for (var ci = 0; ci < rawCmds.length; ci++) {
+                        var cmd = rawCmds[ci];
+                        // Read nested arrays from raw pointers stored as field values
+                        // params_inc_dec_info_array and training_partner_array are arrays
+                        // readObjectFields returns {_array:true,length:N} for them — need raw ptr
+                        var cmdPtr = null;
+                        try {
+                            var dataOffset2 = ptrSize === 8 ? 32 : 16;
+                            var lenOffset2 = ptrSize === 8 ? 24 : 12;
+                            var arrLen = cmdArrayPtr.add(lenOffset2).readS32();
+                            if (ci < arrLen) {
+                                cmdPtr = cmdArrayPtr.add(dataOffset2 + ci * ptrSize).readPointer();
+                            }
+                        } catch(e) {}
+
+                        if (cmdPtr && !cmdPtr.isNull() && cmdInfoFieldList) {
+                            for (var fi = 0; fi < cmdInfoFieldList.length; fi++) {
+                                var cf = cmdInfoFieldList[fi];
+                                if (cf.name === "params_inc_dec_info_array" && cf.offset > 0 && paramsFieldList) {
+                                    var pArr = cmdPtr.add(cf.offset).readPointer();
+                                    cmd.params_inc_dec_info_array = readObjArray(pArr, paramsFieldList);
+                                } else if (cf.name === "training_partner_array" && cf.offset > 0) {
+                                    var tArr = cmdPtr.add(cf.offset).readPointer();
+                                    cmd.training_partner_array = readIntArray(tArr);
+                                }
+                            }
+                        }
+                        commandInfoArray.push(cmd);
+                    }
+                }
+
+                var currentTurn = _lastKnownTurn;
+
+                send({
+                    type: "collect",
+                    domain: "network",
+                    data: {
+                        _seq: _seq++,
+                        event: "home_info_apply",
+                        label: label,
+                        turn: currentTurn,
+                        command_info_array: commandInfoArray,
+                    },
+                });
+            } catch (e) {
+                console.log("[ui] emitHomeInfo error: " + e);
+            }
+        }
+
+        // Log WorkSingleModeHomeInfo field layout once for diagnostics
+        var _workInfoFieldsLogged = false;
+        var workInfoFieldList = extractClassInfoWithParents(workClass.classPtr, workClass.fullName);
+        if (workInfoFieldList) {
+            console.log("[ui] WorkSingleModeHomeInfo fields: " + workInfoFieldList.fieldList.map(function(f){return f.name+"@"+f.offset+":"+f.type;}).join(", "));
+        }
+
+        var hooked = 0;
+        ["Apply", "ApplyFreeCommandInfo", "ApplyTeamCommandInfo"].forEach(function (methodName) {
+            if (!workInfo.methods[methodName]) return;
+            if (hookMethod(workInfo, methodName, -1, {
+                onEnter: function (args) {
+                    if (!_workInfoFieldsLogged && args[0] && !args[0].isNull()) {
+                        _workInfoFieldsLogged = true;
+                        try {
+                            var allFields = workInfoFieldList ? readObjectFields(args[0], workInfoFieldList.fieldList) : null;
+                            send({ type: "collect", domain: "network", data: {
+                                _seq: _seq++, event: "work_home_info_fields",
+                                field_layout: workInfoFieldList ? workInfoFieldList.fieldList.map(function(f){return {name:f.name,offset:f.offset,type:f.type};}) : [],
+                                instance_values: allFields,
+                            }});
+                        } catch(e) {}
+                    }
+                    emitHomeInfo(methodName, args[1]);
+                },
+            })) {
+                hooked++;
+                console.log("[ui] Hooked WorkSingleModeHomeInfo." + methodName);
+            }
+        });
+
+        if (hooked === 0) console.log("[ui] WARNING: no WorkSingleModeHomeInfo methods hooked");
+    })();
+
+    // ══════════════════════════════════════════════════════════════════
+    // LAYER 5: WorkSingleModeData event registration hook
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // Hook the method that stores unchecked events into WorkSingleModeData
+    // so we can seed event_id→story_id map from memory at attach time.
+
+    (function hookWorkSingleModeDataEvents() {
+        var wsdClass = null;
+        iterAssemblyClasses(function (classPtr, fullName, ns, name) {
+            if (fullName === "Gallop.WorkSingleModeData") wsdClass = { classPtr: classPtr, fullName: fullName };
+        });
+        if (!wsdClass) { console.log("[ui] WorkSingleModeData not found"); return; }
+
+        var wsdInfo = extractClassInfo(wsdClass.classPtr, wsdClass.fullName);
+        var methods = Object.keys(wsdInfo.methods);
+
+        // Hook AddStoryInfo — called when unchecked_event_array items are stored.
+        // args[1] = EventInfo object containing event_id and story_id.
+        var eventInfoFieldList = null;
+        iterAssemblyClasses(function (classPtr, fullName, ns, name) {
+            if (fullName === "Gallop.WorkSingleModeData.EventInfo" || fullName === "Gallop.WorkSingleModeData+EventInfo") {
+                var ci = extractClassInfoWithParents(classPtr, fullName);
+                if (ci) {
+                    eventInfoFieldList = ci.fieldList;
+                    send({ type: "collect", domain: "network", data: {
+                        _seq: _seq++, event: "event_info_field_layout",
+                        fields: ci.fieldList.map(function(f){return {name:f.name,offset:f.offset,type:f.type};})
+                    }});
+                }
+            }
+        });
+
+        // ObscuredInt layout: [hiddenValue:i32][padding:i32][padding:i32][padding:i32][cryptoKey:i32]
+        // stride = 20 bytes, actual = hiddenValue ^ cryptoKey (at offset +16)
+        function readObscuredInt(basePtr, fieldOffset) {
+            try {
+                var p = basePtr.add(fieldOffset);
+                var hidden = p.readS32();
+                var key = p.add(16).readS32();
+                return hidden ^ key;
+            } catch(e) { return 0; }
+        }
+
+        if (wsdInfo.methods["AddStoryInfo"]) {
+            hookMethod(wsdInfo, "AddStoryInfo", -1, {
+                onEnter: function (args) {
+                    try {
+                        var infoPtr = args[1];
+                        if (!infoPtr || infoPtr.isNull()) return;
+                        // _eventId @ 16, _storyId @ 56 (both ObscuredInt)
+                        var eventId = readObscuredInt(infoPtr, 16);
+                        var storyId = readObscuredInt(infoPtr, 56);
+                        if (eventId && storyId) {
+                            send({ type: "collect", domain: "network", data: {
+                                _seq: _seq++, event: "story_info_add",
+                                event_id: eventId, story_id: storyId
+                            }});
+                        }
+                    } catch(e) {}
+                }
+            });
+            hookCount++;
+            console.log("[ui] Hooked WorkSingleModeData.AddStoryInfo");
+        }
+    })();
 
     // ── Summary ───────────────────────────────────────────────────────
 

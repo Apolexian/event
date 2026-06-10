@@ -14,6 +14,7 @@ import click
 import msgpack
 from rich.console import Console
 
+from .career_store import load_run, save_run, record_training, record_event
 from .names import build_lookup
 from .store import load, save, record
 from .watcher import watch
@@ -24,6 +25,7 @@ log = logging.getLogger(__name__)
 _SCRIPT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TEXT_DATA = _SCRIPT_ROOT / "data" / "text_data.json"
 DEFAULT_OBS = _SCRIPT_ROOT / "observations.json"
+DEFAULT_CAREERS = _SCRIPT_ROOT / "careers"
 SESSIONS_DIR = _SCRIPT_ROOT / "sessions"
 JS_DIR = _SCRIPT_ROOT / "js"
 
@@ -43,7 +45,7 @@ def _try_msgpack(raw: bytes) -> dict | None:
         return None
 
 
-def _start_collector(session_dir: Path, done: threading.Event, all_domains: bool = False) -> None:
+def _start_collector(session_dir: Path, done: threading.Event, all_domains: bool = False, ready: threading.Event | None = None) -> None:
     try:
         from lib.attach import attach
     except ImportError:
@@ -53,10 +55,23 @@ def _start_collector(session_dir: Path, done: threading.Event, all_domains: bool
     network_path = session_dir / "network.jsonl"
     network_file = network_path.open("a", encoding="utf-8")
 
+    _SCRUB_KEYS = {"steam_session_ticket", "steam_id", "device_id", "auth_key"}
+
+    def _scrub(obj: object) -> None:
+        if isinstance(obj, dict):
+            for k in _SCRUB_KEYS:
+                obj.pop(k, None)
+            for v in obj.values():
+                _scrub(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _scrub(v)
+
     def write(rec: dict, raw: bytes | None = None) -> None:
         if raw:
             decoded = _try_msgpack(raw)
             if decoded is not None:
+                _scrub(decoded)
                 rec["msgpack_decoded"] = decoded
                 rec["raw_b64"] = base64.b64encode(raw).decode("ascii")
             else:
@@ -74,10 +89,17 @@ def _start_collector(session_dir: Path, done: threading.Event, all_domains: bool
         payload = message.get("payload")
         if not isinstance(payload, dict):
             return
+        if payload.get("type") == "hook_status":
+            if ready and not ready.is_set():
+                ready.set()
+            return
         if payload.get("type") == "collect":
             domain = payload.get("domain", "")
+            rec = payload.get("data", {})
+            if rec.get("event") in ("unitytls_write", "ssl_write_reassembled"):
+                return
             if domain == "network" or all_domains:
-                write(payload.get("data", {}), bytes(data) if data else None)
+                write(rec, bytes(data) if data else None)
 
     frida_session = attach()
     if not frida_session:
@@ -114,17 +136,20 @@ def cli():
               help="Path to masterdb_readable/text_data.json.")
 @click.option("--obs", type=click.Path(), default=str(DEFAULT_OBS), show_default=True,
               help="Observations output file.")
+@click.option("--careers", type=click.Path(), default=str(DEFAULT_CAREERS), show_default=True,
+              help="Career timeline output file.")
 @click.option("--label", default="", help="Session label suffix.")
 @click.option("--save-every", default=10, show_default=True,
               help="Save observations every N new records.")
 @click.option("--debug", is_flag=True, default=False, help="Enable debug logging.")
-def run_cmd(text_data, obs, label, save_every, debug):
+def run_cmd(text_data, obs, careers, label, save_every, debug):
     """Attach to game, capture events, tally outcomes live."""
     if debug:
         logging.basicConfig(level=logging.DEBUG)
         logging.getLogger("event_tracker").setLevel(logging.DEBUG)
     text_data_path = Path(text_data)
     obs_path = Path(obs)
+    careers_path = Path(careers)
 
     if not text_data_path.exists():
         console.print(f"[red]text_data.json not found: {text_data_path}[/red]")
@@ -136,12 +161,39 @@ def run_cmd(text_data, obs, label, save_every, debug):
 
     name_lookup = build_lookup(text_data_path)
     obs_data = load(obs_path)
+    careers_dir = Path(careers)
     count = 0
     done = threading.Event()
 
-    def on_observation(story_id: int, event_name: str, choice_index: int, key: str, diff: dict[str, Any], defined: list):
+    current_run_id: list[str] = ["unknown"]
+    current_run: list[dict] = [{"run_id": "unknown", "turns": []}]
+
+    def _flush_run() -> None:
+        save_run(careers_dir, current_run_id[0], current_run[0])
+
+    def on_turn(run_id: str, turn: int, cmd_id: int, actual_gains: dict, options: dict, raw: dict):
+        if run_id != current_run_id[0]:
+            current_run_id[0] = run_id
+            current_run[0] = load_run(careers_dir, run_id)
+        from .career_store import _COMMAND_NAMES
+        record_training(current_run[0], turn, cmd_id, actual_gains, options, raw)
+        _flush_run()
+        name = _COMMAND_NAMES.get(cmd_id, str(cmd_id))
+        gains_str = " ".join(f"{k}:{v:+d}" for k, v in actual_gains.items())
+        console.print(f"[green]train {name}[/green] t{turn} → {gains_str}")
+        console.print("  [dim]options:[/dim]")
+        for opt in options.values():
+            g = " ".join(f"{k}:{v:+d}" for k, v in opt["gains"].items())
+            p = f" cards={opt['partners']}" if opt["partners"] else ""
+            f = f" fail={opt['failure_rate']}%" if opt["failure_rate"] else ""
+            marker = "[bold]*[/bold] " if opt["name"] == name else "  "
+            console.print(f"  {marker}[yellow]{opt['name']}[/yellow]: {g}{p}{f}")
+
+    def on_observation(story_id: int, event_name: str, choice_index: int, key: str, diff: dict[str, Any], defined: list, turn: int, raw: dict):
         nonlocal count
         record(obs_data, story_id, event_name, choice_index, key)
+        record_event(current_run[0], turn, story_id, event_name, choice_index, key, raw)
+        _flush_run()
         count += 1
         diff_str = _format_diff(diff)
         from rich.markup import escape
@@ -157,11 +209,14 @@ def run_cmd(text_data, obs, label, save_every, debug):
     console.print(f"Session: [bold]{session_dir.name}[/bold]")
     console.print("Waiting for game process...")
 
-    collector = threading.Thread(target=_start_collector, args=(session_dir, done), daemon=True)
+    ready = threading.Event()
+    collector = threading.Thread(target=_start_collector, args=(session_dir, done, False, ready), daemon=True)
     collector.start()
+    ready.wait()
+    console.print("[bold green]Hooks ready — safe to play[/bold green]")
 
     try:
-        watch(session_dir, name_lookup, on_observation, stop=done.is_set)
+        watch(session_dir, name_lookup, on_observation, on_turn=on_turn, stop=done.is_set)
     except KeyboardInterrupt:
         pass
     finally:
